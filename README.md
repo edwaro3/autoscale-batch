@@ -8,8 +8,9 @@ This document describes the changes made to the Azure Batch autoscale pool query
 
 | File | Description |
 |------|-------------|
-| `CloudPool pool Query.cs` | Original code with core bug fixes and scaling logic improvements |
+| `CloudPool pool Query.cs` | Core bug fixes and scaling logic improvements |
 | `CloudPool pool Query Refined.cs` | Extends the above with timezone-aware preload logic for peak hour demand |
+| `CloudPool pool Query Lock Store.cs` | Extends the core fixes with a consistency fix — replaces `AutoScaleRun.Timestamp` with the orchestrator's own last-write timestamp to eliminate propagation delay false positives |
 
 ---
 
@@ -78,3 +79,43 @@ Until the template is updated, `string.Format` silently ignores the extra argume
 - The 30% floor and window boundaries should be tested against Application Insights data.
 - If overflow regions ever expand outside Central Europe (e.g. a UK-only pool), the timezone logic will need revisiting as UK time diverges from CET during British Summer Time.
 - During promotional periods, `maxJobs` is expected to be raised via Key Vault and pipeline, which automatically scales the preload floor proportionally without any code change.
+
+---
+
+## `CloudPool pool Query Lock Store.cs` — Propagation delay consistency fix
+
+Addresses a consistency issue where the cooldown check using `AutoScaleRun.Timestamp` could incorrectly allow `EnableAutoScaleAsync` to be called again too soon, hitting a rate limit error.
+
+### The problem
+`AutoScaleRun.Timestamp` records when **Azure Batch's own internal evaluation engine** last ran the formula on its 15-minute cadence. It does **not** record when the orchestrator last called `EnableAutoScaleAsync`. These two clocks are completely independent.
+
+This means a request arriving shortly after a successful orchestrator write could query the pool, see an `AutoScaleRun.Timestamp` that is many minutes old (because the 15-minute engine hasn't fired yet), incorrectly conclude the cooldown has elapsed, and attempt another `EnableAutoScaleAsync` call — hitting the rate limit.
+
+### The fix
+Instead of relying on `AutoScaleRun.Timestamp`, the orchestrator reads its own last-write timestamp from its distributed lock store:
+
+```csharp
+DateTimeOffset? lastScaleWrite = await this._scaleLockStore.GetLastWriteTimeAsync(this._settings.BatchPoolId);
+
+bool passedCooldown = lastScaleWrite is null
+                      || DateTimeOffset.UtcNow - lastScaleWrite.Value >= TimeSpan.FromMinutes(5);
+```
+
+After a successful `EnableAutoScaleAsync` call, the current UTC time is immediately written back to the store:
+
+```csharp
+await this._scaleLockStore.SetLastWriteTimeAsync(this._settings.BatchPoolId, DateTimeOffset.UtcNow);
+```
+
+This gives an accurate, orchestrator-owned record of the last write — independent of Azure Batch's eventual-consistency propagation delay.
+
+### What is the lock store / blob backing the lock?
+
+Durable Functions uses **Azure Blob Storage** to implement its distributed lock (the `IDurableOrchestrationContext` lease mechanism). When a lock is acquired, the Durable Functions runtime writes a lease blob to a Storage Account container. Only one function instance can hold the lease at a time — this is what prevents concurrent `EnableAutoScaleAsync` calls across instances.
+
+The `_scaleLockStore` refers to a lightweight wrapper around that same Storage Account (or a dedicated blob/table within it) that persists one timestamp value per pool ID. Concretely, the two simplest implementation options are:
+
+- **Blob metadata** — after acquiring the lease blob, write the timestamp as a metadata tag on the same blob. No extra storage resource needed, and reads/writes are atomic with the lease.
+- **Azure Table Storage** — a single row per `BatchPoolId` with a `LastScaleWrite` column. Minimal cost, fast point reads, and easy to inspect manually for debugging.
+
+Either approach ensures that all function instances — regardless of which host they run on — see the same last-write time and make consistent cooldown decisions.
