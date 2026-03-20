@@ -3,19 +3,18 @@ CloudPool pool = await client.PoolOperations.GetPoolAsync(
     detailLevel: new ODATADetailLevel(selectClause: "id,allocationState,autoScaleFormula,autoScaleRun"),
     additionalBehaviors: BatchClientRetryPolicies);
 
-// Only proceed once the previous evaluation has fully propagated (5-minute orchestrator window).
-// The distributed lock ensures only one instance reaches this point concurrently, so the
-// rare propagation-delay errors are limited to the window between lock release and pool state sync.
-bool passedCooldown = pool.AutoScaleRun?.Timestamp is not { } lastRun
-                      || DateTime.UtcNow - lastRun.ToUniversalTime() >= TimeSpan.FromMinutes(5);
+// Use the orchestrator's own last-write timestamp rather than AutoScaleRun.Timestamp.
+// AutoScaleRun.Timestamp reflects Azure Batch's 15-minute evaluation cadence, not when
+// the orchestrator last called EnableAutoScaleAsync — using it causes false positives.
+DateTimeOffset? lastScaleWrite = await this._scaleLockStore.GetLastWriteTimeAsync(this._settings.BatchPoolId);
+
+bool passedCooldown = lastScaleWrite is null
+                      || DateTimeOffset.UtcNow - lastScaleWrite.Value >= TimeSpan.FromMinutes(5);
 
 if (pool.AllocationState is AllocationState.Steady && passedCooldown)
 {
-    // Compute a timezone-aware preload floor so the pool keeps nodes warm ahead of
-    // predictable demand spikes. Poland is the primary processing region with overflow
-    // to Italy and Spain — all three share Central European Time (CET/CEST, UTC+1/UTC+2),
-    // so a single timezone ID covers all regions. DST transitions are also synchronised
-    // across all three countries, so no per-region adjustment is needed.
+    // Poland is the primary region; Italy and Spain overflow. All three share CET/CEST
+    // (UTC+1/UTC+2) with synchronised DST — one timezone ID covers all regions.
     TimeZoneInfo polandTz = TimeZoneInfo.FindSystemTimeZoneById("Central European Standard Time");
     TimeOnly localTime = TimeOnly.FromTimeSpan(
         TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, polandTz).TimeOfDay);
@@ -43,4 +42,8 @@ if (pool.AllocationState is AllocationState.Steady && passedCooldown)
         formattedFormula,
         autoScaleEvaluationInterval: TimeSpan.FromMinutes(15),
         additionalBehaviors: BatchClientRetryPolicies);
+
+    // Record write time so subsequent requests within the 5-minute window
+    // see an accurate cooldown timestamp, not a stale pool evaluation time.
+    await this._scaleLockStore.SetLastWriteTimeAsync(this._settings.BatchPoolId, DateTimeOffset.UtcNow);
 }

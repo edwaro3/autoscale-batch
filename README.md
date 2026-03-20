@@ -1,6 +1,6 @@
 # Azure Batch Autoscale — Query Changes
 
-This document describes the changes made to the Azure Batch autoscale pool query code, which is part of the orchestrator responsible for managing render job distribution across Azure Batch pools.
+This document describes all changes made to the Azure Batch autoscale pool query code, which is part of the orchestrator responsible for managing render job distribution across Azure Batch pools.
 
 ---
 
@@ -8,13 +8,18 @@ This document describes the changes made to the Azure Batch autoscale pool query
 
 | File | Description |
 |------|-------------|
-| `CloudPool pool Query.cs` | Core bug fixes and scaling logic improvements |
-| `CloudPool pool Query Refined.cs` | Extends the above with timezone-aware preload logic for peak hour demand |
-| `CloudPool pool Query Lock Store.cs` | Extends the core fixes with a consistency fix — replaces `AutoScaleRun.Timestamp` with the orchestrator's own last-write timestamp to eliminate propagation delay false positives |
+| `CloudPool pool Query Combined.cs` | Production query — all fixes and improvements combined |
+| `README.md` | This document — full logic and reasoning for every change |
 
 ---
 
-## `CloudPool pool Query.cs` — Core fixes
+## Summary of all changes
+
+The combined query incorporates four categories of change, each documented below.
+
+---
+
+## 1. Core bug fixes
 
 ### 1. Typo fix: `_scaleForumula` → `_scaleFormula`
 The field name was misspelled, which would cause a compile error if the correct field name is used elsewhere in the codebase.
@@ -32,9 +37,9 @@ The original call did not set an evaluation interval, relying on the Azure Batch
 
 ---
 
-## `CloudPool pool Query Refined.cs` — Timezone-aware preload floor
+## 2. Timezone-aware preload floor
 
-Extends all changes in `CloudPool pool Query.cs` with additional logic to keep nodes warm ahead of predictable daily demand spikes.
+Extends all changes in section 1 with additional logic to keep nodes warm ahead of predictable daily demand spikes.
 
 ### Background
 Production data shows three recurring peak windows when designer activity causes sharp spikes in concurrent render jobs (up to 200–300 jobs):
@@ -82,7 +87,7 @@ Until the template is updated, `string.Format` silently ignores the extra argume
 
 ---
 
-## `CloudPool pool Query Lock Store.cs` — Propagation delay consistency fix
+## 3. Propagation delay consistency fix
 
 Addresses a consistency issue where the cooldown check using `AutoScaleRun.Timestamp` could incorrectly allow `EnableAutoScaleAsync` to be called again too soon, hitting a rate limit error.
 
